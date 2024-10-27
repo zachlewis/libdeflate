@@ -51,7 +51,10 @@
  * instructions.  Note that the x86 crc32 instruction cannot be used, as it is
  * for a different polynomial, not the gzip one.  For an explanation of CRC
  * folding with carryless multiplication instructions, see
- * scripts/gen_crc32_multipliers.c and the following paper:
+ * scripts/gen_crc32_multipliers.c and the following blog posts and papers:
+ *
+ *	"An alternative exposition of crc32_4k_pclmulqdq"
+ *	https://www.corsix.org/content/alternative-exposition-crc32_4k_pclmulqdq
  *
  *	"Fast CRC Computation for Generic Polynomials Using PCLMULQDQ Instruction"
  *	https://www.intel.com/content/dam/www/public/us/en/documents/white-papers/fast-crc-computation-generic-polynomials-pclmulqdq-paper.pdf
@@ -193,10 +196,9 @@ ADD_SUFFIX(crc32_x86)(u32 crc, const u8 *p, size_t len)
 	const vec_t mults_2v = MULTS_2V;
 	const vec_t mults_1v = MULTS_1V;
 	const __m128i mults_128b = _mm_set_epi64x(CRC32_X95_MODG, CRC32_X159_MODG);
-	const __m128i final_mult = _mm_set_epi64x(0, CRC32_X63_MODG);
-	const __m128i mask32 = _mm_set_epi32(0, 0, 0, 0xFFFFFFFF);
 	const __m128i barrett_reduction_constants =
 		_mm_set_epi64x(CRC32_BARRETT_CONSTANT_2, CRC32_BARRETT_CONSTANT_1);
+	const __m128i mask32 = _mm_set_epi32(0, 0xFFFFFFFF, 0, 0);
 	vec_t v0, v1, v2, v3, v4, v5, v6, v7;
 	__m128i x0 = _mm_cvtsi32_si128(crc);
 	__m128i x1;
@@ -389,68 +391,73 @@ less_than_16_remaining:
 #if USE_AVX512
 reduce_x0:
 #endif
+	/*
+	 * Generate the final CRC32 from the 128-bit value A = x0 as follows:
+	 *
+	 *	crc = x^32 * A mod G
+	 *	    = x^32 * (x^64*A_L + A_H) mod G
+	 *	    = x^32 * ((x^32*(x^32*A_L mod G)) + A_H) mod G
+	 *
+	 * I.e.:
+	 *	crc := 0
+	 *	crc := x^32 * (x^32*crc + A_L) mod G
+	 *	crc := x^32 * (x^32*crc + A_H) mod G
+	 *
+	 * A_L and A_H refer to the physically low and high qwords of A, which
+	 * contain the high and low polynomial coefficients respectively!
+	 */
 
 	/*
-	 * Fold 128 => 96 bits.  This also implicitly appends 32 zero bits,
-	 * which is equivalent to multiplying by x^32.  This is needed because
-	 * the CRC is defined as M(x)*x^32 mod G(x), not just M(x) mod G(x).
+	 * Using Barrett reduction, the first step is:
+	 *
+	 *	crc := x^32*A_L mod G
+	 *	     = ((A_L * (x^(32+n) // G)) // x^n) * G mod x^32  [for n >= 63]
+	 *	     = ((A_L * (x^95 // G)) // x^63) * G mod x^32
+	 *
+	 * The // symbol denotes floored division, producing the unique quotient
+	 * polynomial for the given dividend and divisor.  Two carryless
+	 * multiplications, denoted by *, are needed.  The first is of A_L,
+	 * which is of max degree 63, by the degree-63 constant x^95 // G.  This
+	 * produces a product of max degree 126.  Considering CRC32's reverse
+	 * coefficient order, the low qword of the product contains terms x^63
+	 * through x^126, which become x^0 through x^63 after the division by
+	 * x^63 which happens for free.  Multiplying this value of max degree 63
+	 * by the degree-32 constant G gives a product of max degree 95, equal
+	 * to x^32*A_L + (x^32*A_L mod G).  The desired mod G part is in the
+	 * low-order 32 polynomial coefficients, i.e. the index 2 dword.
+	 *
+	 * Note that when choosing n in (A_L * (x^(32+n) // G)) // x^n, only
+	 * n=63 works.  n < 63 would be less than the maximum degree of A_L,
+	 * which would cause insufficient precision to be carried through the
+	 * calculation.  n > 63 would require a carryless multiplication
+	 * instruction that takes an input larger than 64 bits.
 	 */
-	x0 = _mm_xor_si128(_mm_srli_si128(x0, 8),
-			   _mm_clmulepi64_si128(x0, mults_128b, 0x10));
-
-	/* Fold 96 => 64 bits. */
-	x0 = _mm_xor_si128(_mm_srli_si128(x0, 4),
-			   _mm_clmulepi64_si128(_mm_and_si128(x0, mask32),
-						final_mult, 0x00));
+	x1 = _mm_clmulepi64_si128(x0, barrett_reduction_constants, 0x00);
+	x1 = _mm_clmulepi64_si128(x1, barrett_reduction_constants, 0x10);
 
 	/*
-	 * Reduce 64 => 32 bits using Barrett reduction.
+	 * The second step, also using Barrett reduction:
 	 *
-	 * Let M(x) = A(x)*x^32 + B(x) be the remaining message.  The goal is to
-	 * compute R(x) = M(x) mod G(x).  Since degree(B(x)) < degree(G(x)):
+	 *	crc := x^32 * (x^32*crc + A_H) mod G
+	 *	     = floor(((x^32*crc + A_H) * floor(x^95 / G)) / x^63) * G mod x^32
 	 *
-	 *	R(x) = (A(x)*x^32 + B(x)) mod G(x)
-	 *	     = (A(x)*x^32) mod G(x) + B(x)
-	 *
-	 * Then, by the Division Algorithm there exists a unique q(x) such that:
-	 *
-	 *	A(x)*x^32 mod G(x) = A(x)*x^32 - q(x)*G(x)
-	 *
-	 * Since the left-hand side is of maximum degree 31, the right-hand side
-	 * must be too.  This implies that we can apply 'mod x^32' to the
-	 * right-hand side without changing its value:
-	 *
-	 *	(A(x)*x^32 - q(x)*G(x)) mod x^32 = q(x)*G(x) mod x^32
-	 *
-	 * Note that '+' is equivalent to '-' in polynomials over GF(2).
-	 *
-	 * We also know that:
-	 *
-	 *	              / A(x)*x^32 \
-	 *	q(x) = floor (  ---------  )
-	 *	              \    G(x)   /
-	 *
-	 * To compute this efficiently, we can multiply the top and bottom by
-	 * x^32 and move the division by G(x) to the top:
-	 *
-	 *	              / A(x) * floor(x^64 / G(x)) \
-	 *	q(x) = floor (  -------------------------  )
-	 *	              \           x^32            /
-	 *
-	 * Note that floor(x^64 / G(x)) is a constant.
-	 *
-	 * So finally we have:
-	 *
-	 *	                          / A(x) * floor(x^64 / G(x)) \
-	 *	R(x) = B(x) + G(x)*floor (  -------------------------  )
-	 *	                          \           x^32            /
+	 * Same as previous but uses the high qword of A and starts with adding
+	 * x^32*crc to it.  Considering CRC32's reverse-coefficient order, that
+	 * means xor'ing crc into the index 2 dword of A, which is conveniently
+	 * the same dword index that crc is in.  Select the crc dword by and-ing
+	 * with a mask, then do the xor; that is a ternary boolean operation
+	 * a ^ (b & c) which with AVX512 is a vpternlog with immediate 0x78.
 	 */
-	x1 = _mm_clmulepi64_si128(_mm_and_si128(x0, mask32),
-				  barrett_reduction_constants, 0x00);
-	x1 = _mm_clmulepi64_si128(_mm_and_si128(x1, mask32),
-				  barrett_reduction_constants, 0x10);
-	x0 = _mm_xor_si128(x0, x1);
-	return _mm_extract_epi32(x0, 1);
+#if USE_AVX512
+	x0 = _mm_ternarylogic_epi32(x0, x1, mask32, 0x78);
+#else
+	x0 = _mm_xor_si128(x0, _mm_and_si128(x1, mask32));
+#endif
+	x0 = _mm_clmulepi64_si128(x0, barrett_reduction_constants, 0x01);
+	x0 = _mm_clmulepi64_si128(x0, barrett_reduction_constants, 0x10);
+	/* The resulting crc is in the index 2 dword. */
+
+	return _mm_extract_epi32(x0, 2);
 }
 
 #undef vec_t
